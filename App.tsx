@@ -1,56 +1,50 @@
-import React, { useEffect, useState, useCallback, useMemo } from 'react'
-import { View, Text, StyleSheet, Dimensions } from 'react-native'
-import {
-  Camera,
-  useCameraDevice,
-  useFrameProcessor,
-  VisionCameraProxy,
-} from 'react-native-vision-camera'
+import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react'
+import { View, Text, StyleSheet, Dimensions, TouchableOpacity } from 'react-native'
+import { Camera, useCameraDevice, useFrameProcessor, VisionCameraProxy } from 'react-native-vision-camera'
 import { Worklets } from 'react-native-worklets-core'
+import Svg, { Path } from 'react-native-svg'  
 
 const detectHandsPlugin = VisionCameraProxy.initFrameProcessorPlugin('detectHands', {})
-
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window')
 
-// All 21 points — tips are bigger
-const TIP_POINTS = [4, 8, 12, 16, 20]
-
-// Camera frame is 640x480 landscape, rotated 90° on phone = 480x640
-// So on screen: width=480 maps to SCREEN_WIDTH, height=640 maps to SCREEN_HEIGHT
-const CAMERA_RENDER_WIDTH = SCREEN_WIDTH
 const CAMERA_RENDER_HEIGHT = SCREEN_WIDTH * (640 / 480)
 const CAMERA_OFFSET_Y = (SCREEN_HEIGHT - CAMERA_RENDER_HEIGHT) / 2
 
-const classifyGesture = (landmarks: any[]): string => {
-  const thumbTip  = landmarks[4],  thumbMCP  = landmarks[1]
-  const indexTip  = landmarks[8],  indexMCP  = landmarks[5]
-  const middleTip = landmarks[12], middleMCP = landmarks[9]
-  const ringTip   = landmarks[16], ringMCP   = landmarks[13]
-  const pinkyTip  = landmarks[20], pinkyMCP  = landmarks[17]
+// Convert normalized landmark to screen coordinates
+const toScreen = (point: any, isFront: boolean) => ({
+  x: (isFront ? 1 - point.x : point.x) * SCREEN_WIDTH,
+  y: CAMERA_OFFSET_Y + point.y * CAMERA_RENDER_HEIGHT,
+})
 
-  // For front camera x is flipped so thumb logic flips too
-  const thumbUp  = thumbTip.x > thumbMCP.x  // flipped for front camera
-  const indexUp  = indexTip.y  < indexMCP.y
-  const middleUp = middleTip.y < middleMCP.y
-  const ringUp   = ringTip.y   < ringMCP.y
-  const pinkyUp  = pinkyTip.y  < pinkyMCP.y
+// Detect which fingers are up
+const getFingersUp = (landmarks: any[]) => ({
+  index:  landmarks[8].y  < landmarks[5].y,
+  middle: landmarks[12].y < landmarks[9].y,
+  ring:   landmarks[16].y < landmarks[13].y,
+  pinky:  landmarks[20].y < landmarks[17].y,
+})
 
-  if (!indexUp && !middleUp && !ringUp && !pinkyUp && !thumbUp) return 'A'
-  if ( indexUp &&  middleUp &&  ringUp &&  pinkyUp)             return 'B'
-  if ( indexUp && !middleUp && !ringUp && !pinkyUp)             return 'D'
-  if ( indexUp &&  middleUp && !ringUp && !pinkyUp && !thumbUp) return 'V'
-  if (!indexUp && !middleUp && !ringUp &&  pinkyUp)             return 'I'
-  if ( thumbUp &&  indexUp  && !middleUp && !ringUp && !pinkyUp) return 'L'
-  if ( indexUp &&  middleUp &&  ringUp  && !pinkyUp)            return 'W'
-  if ( thumbUp && !indexUp  && !middleUp && !ringUp &&  pinkyUp) return 'Y'
-  return '?'
+// Detect gesture mode
+const getMode = (landmarks: any[]): 'draw' | 'clear' | 'idle' => {
+  const f = getFingersUp(landmarks)
+  // Only index up = draw
+  if (f.index && !f.middle && !f.ring && !f.pinky) return 'draw'
+  // All fingers down = clear
+  if (!f.index && !f.middle && !f.ring && !f.pinky) return 'clear'
+  return 'idle'  // any other combo = pause drawing (lift pen)
 }
 
 export default function App() {
   const device = useCameraDevice('front')
   const [hasPermission, setHasPermission] = useState<boolean | null>(null)
   const [hands, setHands] = useState<any[]>([])
-  const [detectedSign, setDetectedSign] = useState<string>('Show your hand')
+  const [mode, setMode] = useState<'draw' | 'clear' | 'idle'>('idle')
+
+  // Drawing state
+  const [paths, setPaths] = useState<string[]>([])           // completed paths
+  const [currentPath, setCurrentPath] = useState<string>('')  // path being drawn
+
+  const lastPointRef = useRef<{ x: number; y: number } | null>(null)
 
   useEffect(() => {
     Camera.requestCameraPermission().then((status) => {
@@ -59,14 +53,58 @@ export default function App() {
   }, [])
 
   const onResult = useCallback((data: any) => {
-    if (data?.hands?.length > 0) {
-      setHands(data.hands)
-      setDetectedSign(classifyGesture(data.hands[0].landmarks))
-    } else {
+    if (!data?.hands?.length) {
       setHands([])
-      setDetectedSign('Show your hand')
+      setMode('idle')
+      // Save current path when hand disappears
+      setCurrentPath(prev => {
+        if (prev) setPaths(p => [...p, prev])
+        return ''
+      })
+      lastPointRef.current = null
+      return
     }
-  }, [])
+
+    const landmarks = data.hands[0].landmarks
+    setHands(data.hands)
+
+    const detectedMode = getMode(landmarks)
+    setMode(detectedMode)
+
+    if (detectedMode === 'clear') {
+      // ✅ Fist = clear canvas
+      setPaths([])
+      setCurrentPath('')
+      lastPointRef.current = null
+      return
+    }
+
+    if (detectedMode === 'draw') {
+      // ✅ Index finger up = draw with fingertip
+      const tip = landmarks[8]
+      const { x, y } = toScreen(tip, true)
+
+      if (lastPointRef.current === null) {
+        // Start new stroke
+        setCurrentPath(`M${x.toFixed(1)},${y.toFixed(1)}`)
+      } else {
+        // Continue stroke with smooth curve
+        const lx = lastPointRef.current.x
+        const ly = lastPointRef.current.y
+        const mx = ((lx + x) / 2).toFixed(1)
+        const my = ((ly + y) / 2).toFixed(1)
+        setCurrentPath(prev => `${prev} Q${lx.toFixed(1)},${ly.toFixed(1)} ${mx},${my}`)
+      }
+      lastPointRef.current = { x, y }
+    } else {
+      // idle = lift pen, save stroke
+      if (currentPath) {
+        setPaths(prev => [...prev, currentPath])
+        setCurrentPath('')
+      }
+      lastPointRef.current = null
+    }
+  }, [currentPath])
 
   const onResultJS = useMemo(() => Worklets.createRunOnJS(onResult), [onResult])
 
@@ -81,9 +119,13 @@ export default function App() {
   if (!hasPermission) return <Text>No camera permission</Text>
   if (device == null) return <Text>Loading camera...</Text>
 
+  const modeColor = mode === 'draw' ? '#FF3B30' : mode === 'clear' ? '#FF9500' : '#FFFFFF'
+  const modeLabel = mode === 'draw' ? '✏️ Drawing' : mode === 'clear' ? '🗑 Clearing...' : '✋ Idle'
+
   return (
     <View style={styles.container}>
 
+      {/* Camera */}
       <Camera
         style={StyleSheet.absoluteFill}
         device={device}
@@ -91,90 +133,92 @@ export default function App() {
         frameProcessor={frameProcessor}
       />
 
-      {/* Landmark dots overlay */}
-      <View style={StyleSheet.absoluteFill}>
-        {hands.map((hand: any, handIndex: number) =>
-          hand?.landmarks?.map((point: any, pointIndex: number) => {
-            const isTip = TIP_POINTS.includes(pointIndex)
+      {/* SVG Drawing Canvas */}
+      <Svg style={StyleSheet.absoluteFill}>
+        {/* Completed paths */}
+        {paths.map((d, i) => (
+          <Path key={i} d={d} stroke="#FF3B30" strokeWidth={4} fill="none" strokeLinecap="round" strokeLinejoin="round"/>
+        ))}
+        {/* Current path being drawn */}
+        {currentPath ? (
+          <Path d={currentPath} stroke="#FF3B30" strokeWidth={4} fill="none" strokeLinecap="round" strokeLinejoin="round"/>
+        ) : null}
+      </Svg>
 
-            // ✅ Flip x for front camera, offset y for aspect ratio
-            const x = (1 - point.x) * CAMERA_RENDER_WIDTH
-            const y = CAMERA_OFFSET_Y + point.y * CAMERA_RENDER_HEIGHT
-            const size = isTip ? 14 : 8
+      {/* Fingertip dot — shows where you're drawing */}
+      {hands.length > 0 && (() => {
+        const tip = hands[0].landmarks[8]
+        const { x, y } = toScreen(tip, true)
+        return (
+          <View style={[styles.fingertipDot, {
+            left: x - 10,
+            top: y - 10,
+            backgroundColor: mode === 'draw' ? '#FF3B30' : 'rgba(255,255,255,0.5)',
+            transform: [{ scale: mode === 'draw' ? 1.2 : 1 }]
+          }]}/>
+        )
+      })()}
 
-            return (
-              <View
-                key={`${handIndex}-${pointIndex}`}
-                style={{
-                  position: 'absolute',
-                  left: x - size / 2,
-                  top: y - size / 2,
-                  width: size,
-                  height: size,
-                  borderRadius: size / 2,
-                  backgroundColor: isTip ? '#FF3B30' : 'rgba(255,255,255,0.7)',
-                }}
-              />
-            )
-          })
-        )}
+      {/* Mode indicator */}
+      <View style={[styles.modeBadge, { borderColor: modeColor }]}>
+        <Text style={[styles.modeText, { color: modeColor }]}>{modeLabel}</Text>
       </View>
 
-      {/* Hands count — top */}
-      <View style={styles.topBadge}>
-        <Text style={styles.topBadgeText}>
-          {hands.length > 0
-            ? `${hands.length} hand${hands.length > 1 ? 's' : ''} detected`
-            : 'No hands detected'}
-        </Text>
+      {/* Instructions */}
+      <View style={styles.instructions}>
+        <Text style={styles.instrText}>☝️ Index up = Draw</Text>
+        <Text style={styles.instrText}>✊ Fist = Clear</Text>
+        <Text style={styles.instrText}>✋ Other = Pause</Text>
       </View>
 
-      {/* Detected sign — bottom */}
-      <View style={styles.bottomOverlay}>
-        <Text style={styles.signLabel}>Sign</Text>
-        <Text style={styles.signText}>{detectedSign}</Text>
-      </View>
+      {/* Manual clear button */}
+      <TouchableOpacity style={styles.clearBtn} onPress={() => { setPaths([]); setCurrentPath('') }}>
+        <Text style={styles.clearBtnText}>Clear</Text>
+      </TouchableOpacity>
 
     </View>
   )
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: 'black',
+  container: { flex: 1, backgroundColor: 'black' },
+  fingertipDot: {
+    position: 'absolute',
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    borderWidth: 2,
+    borderColor: 'white',
   },
-  topBadge: {
+  modeBadge: {
     position: 'absolute',
     top: 60,
     alignSelf: 'center',
-    backgroundColor: 'rgba(0,0,0,0.55)',
+    borderWidth: 1.5,
+    borderRadius: 20,
     paddingHorizontal: 16,
     paddingVertical: 8,
-    borderRadius: 20,
+    backgroundColor: 'rgba(0,0,0,0.5)',
   },
-  topBadgeText: {
-    color: 'white',
-    fontSize: 14,
-  },
-  bottomOverlay: {
+  modeText: { fontSize: 16, fontWeight: '600' },
+  instructions: {
     position: 'absolute',
-    bottom: 60,
+    bottom: 100,
+    left: 20,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    padding: 12,
+    borderRadius: 12,
+    gap: 4,
+  },
+  instrText: { color: 'white', fontSize: 13 },
+  clearBtn: {
+    position: 'absolute',
+    bottom: 40,
     alignSelf: 'center',
-    backgroundColor: 'rgba(0,0,0,0.7)',
-    paddingHorizontal: 40,
-    paddingVertical: 20,
-    borderRadius: 16,
-    alignItems: 'center',
+    backgroundColor: 'rgba(255,59,48,0.8)',
+    paddingHorizontal: 32,
+    paddingVertical: 12,
+    borderRadius: 24,
   },
-  signLabel: {
-    color: 'rgba(255,255,255,0.6)',
-    fontSize: 14,
-    marginBottom: 4,
-  },
-  signText: {
-    color: 'white',
-    fontSize: 72,
-    fontWeight: '700',
-  },
+  clearBtnText: { color: 'white', fontSize: 16, fontWeight: '600' },
 })
