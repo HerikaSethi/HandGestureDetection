@@ -2,47 +2,52 @@ import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react'
 import { View, Text, StyleSheet, Dimensions, TouchableOpacity } from 'react-native'
 import { Camera, useCameraDevice, useFrameProcessor, VisionCameraProxy } from 'react-native-vision-camera'
 import { Worklets } from 'react-native-worklets-core'
-import Svg, { Path } from 'react-native-svg'  
+import Svg, { Path } from 'react-native-svg'
 
 const detectHandsPlugin = VisionCameraProxy.initFrameProcessorPlugin('detectHands', {})
-const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window')
 
+const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window')
 const CAMERA_RENDER_HEIGHT = SCREEN_WIDTH * (640 / 480)
 const CAMERA_OFFSET_Y = (SCREEN_HEIGHT - CAMERA_RENDER_HEIGHT) / 2
 
-// Convert normalized landmark to screen coordinates
+// CONFIG
+const SMOOTHING = 0.6
+const MIN_DISTANCE = 4
+const PINCH_THRESHOLD = 0.06
+
+// Convert normalized → screen
 const toScreen = (point: any, isFront: boolean) => ({
   x: (isFront ? 1 - point.x : point.x) * SCREEN_WIDTH,
   y: CAMERA_OFFSET_Y + point.y * CAMERA_RENDER_HEIGHT,
 })
 
-// Detect which fingers are up
-const getFingersUp = (landmarks: any[]) => ({
-  index:  landmarks[8].y  < landmarks[5].y,
-  middle: landmarks[12].y < landmarks[9].y,
-  ring:   landmarks[16].y < landmarks[13].y,
-  pinky:  landmarks[20].y < landmarks[17].y,
-})
+// Distance between 2 points
+const getDistance = (a: any, b: any) => {
+  const dx = a.x - b.x
+  const dy = a.y - b.y
+  return Math.sqrt(dx * dx + dy * dy)
+}
 
-// Detect gesture mode
-const getMode = (landmarks: any[]): 'draw' | 'clear' | 'idle' => {
-  const f = getFingersUp(landmarks)
-  // Only index up = draw
-  if (f.index && !f.middle && !f.ring && !f.pinky) return 'draw'
-  // All fingers down = clear
-  if (!f.index && !f.middle && !f.ring && !f.pinky) return 'clear'
-  return 'idle'  // any other combo = pause drawing (lift pen)
+// Pinch detection
+const getMode = (landmarks: any[]): 'draw' | 'idle' => {
+  const thumb = landmarks[4]
+  const index = landmarks[8]
+
+  const dist = getDistance(thumb, index)
+
+  if (dist < PINCH_THRESHOLD) return 'draw'
+  return 'idle'
 }
 
 export default function App() {
   const device = useCameraDevice('front')
   const [hasPermission, setHasPermission] = useState<boolean | null>(null)
-  const [hands, setHands] = useState<any[]>([])
-  const [mode, setMode] = useState<'draw' | 'clear' | 'idle'>('idle')
 
-  // Drawing state
-  const [paths, setPaths] = useState<string[]>([])           // completed paths
-  const [currentPath, setCurrentPath] = useState<string>('')  // path being drawn
+  const [hands, setHands] = useState<any[]>([])
+  const [mode, setMode] = useState<'draw' | 'idle'>('idle')
+
+  const [paths, setPaths] = useState<string[]>([])
+  const [currentPath, setCurrentPath] = useState<string>('')
 
   const lastPointRef = useRef<{ x: number; y: number } | null>(null)
 
@@ -56,11 +61,12 @@ export default function App() {
     if (!data?.hands?.length) {
       setHands([])
       setMode('idle')
-      // Save current path when hand disappears
+
       setCurrentPath(prev => {
         if (prev) setPaths(p => [...p, prev])
         return ''
       })
+
       lastPointRef.current = null
       return
     }
@@ -71,61 +77,72 @@ export default function App() {
     const detectedMode = getMode(landmarks)
     setMode(detectedMode)
 
-    if (detectedMode === 'clear') {
-      // ✅ Fist = clear canvas
-      setPaths([])
-      setCurrentPath('')
-      lastPointRef.current = null
-      return
-    }
-
     if (detectedMode === 'draw') {
-      // ✅ Index finger up = draw with fingertip
-      const tip = landmarks[8]
-      const { x, y } = toScreen(tip, true)
+      let { x, y } = toScreen(landmarks[8], true)
 
-      if (lastPointRef.current === null) {
-        // Start new stroke
+      // smoothing
+      if (lastPointRef.current) {
+        x = lastPointRef.current.x * SMOOTHING + x * (1 - SMOOTHING)
+        y = lastPointRef.current.y * SMOOTHING + y * (1 - SMOOTHING)
+
+        // jitter filter
+        const dx = x - lastPointRef.current.x
+        const dy = y - lastPointRef.current.y
+        const dist = Math.sqrt(dx * dx + dy * dy)
+
+        if (dist < MIN_DISTANCE) return
+      }
+
+      if (!lastPointRef.current) {
         setCurrentPath(`M${x.toFixed(1)},${y.toFixed(1)}`)
       } else {
-        // Continue stroke with smooth curve
         const lx = lastPointRef.current.x
         const ly = lastPointRef.current.y
-        const mx = ((lx + x) / 2).toFixed(1)
-        const my = ((ly + y) / 2).toFixed(1)
-        setCurrentPath(prev => `${prev} Q${lx.toFixed(1)},${ly.toFixed(1)} ${mx},${my}`)
+
+        const mx = (lx + x) / 2
+        const my = (ly + y) / 2
+
+        setCurrentPath(prev =>
+          `${prev} Q${lx.toFixed(1)},${ly.toFixed(1)} ${mx.toFixed(1)},${my.toFixed(1)}`
+        )
       }
+
       lastPointRef.current = { x, y }
+
     } else {
-      // idle = lift pen, save stroke
+      // stop drawing
       if (currentPath) {
         setPaths(prev => [...prev, currentPath])
         setCurrentPath('')
       }
       lastPointRef.current = null
     }
+
   }, [currentPath])
 
   const onResultJS = useMemo(() => Worklets.createRunOnJS(onResult), [onResult])
 
+  // frame skipping for performance
+  const frameCount = useRef(0)
+
   const frameProcessor = useFrameProcessor((frame) => {
     'worklet'
+
+    frameCount.current++
+    if (frameCount.current % 2 !== 0) return
+
     if (detectHandsPlugin == null) return
     const result = detectHandsPlugin.call(frame)
     onResultJS(result)
   }, [onResultJS])
 
   if (hasPermission === null) return <Text>Requesting permission...</Text>
-  if (!hasPermission) return <Text>No camera permission</Text>
+  if (!hasPermission) return <Text>No permission</Text>
   if (device == null) return <Text>Loading camera...</Text>
-
-  const modeColor = mode === 'draw' ? '#FF3B30' : mode === 'clear' ? '#FF9500' : '#FFFFFF'
-  const modeLabel = mode === 'draw' ? '✏️ Drawing' : mode === 'clear' ? '🗑 Clearing...' : '✋ Idle'
 
   return (
     <View style={styles.container}>
 
-      {/* Camera */}
       <Camera
         style={StyleSheet.absoluteFill}
         device={device}
@@ -133,47 +150,43 @@ export default function App() {
         frameProcessor={frameProcessor}
       />
 
-      {/* SVG Drawing Canvas */}
+      {/* Drawing */}
       <Svg style={StyleSheet.absoluteFill}>
-        {/* Completed paths */}
         {paths.map((d, i) => (
-          <Path key={i} d={d} stroke="#FF3B30" strokeWidth={4} fill="none" strokeLinecap="round" strokeLinejoin="round"/>
+          <Path key={i} d={d} stroke="#FF3B30" strokeWidth={4} fill="none" strokeLinecap="round" />
         ))}
-        {/* Current path being drawn */}
         {currentPath ? (
-          <Path d={currentPath} stroke="#FF3B30" strokeWidth={4} fill="none" strokeLinecap="round" strokeLinejoin="round"/>
+          <Path d={currentPath} stroke="#FF3B30" strokeWidth={4} fill="none" strokeLinecap="round" />
         ) : null}
       </Svg>
 
-      {/* Fingertip dot — shows where you're drawing */}
+      {/* fingertip indicator */}
       {hands.length > 0 && (() => {
-        const tip = hands[0].landmarks[8]
-        const { x, y } = toScreen(tip, true)
+        const { x, y } = toScreen(hands[0].landmarks[8], true)
         return (
-          <View style={[styles.fingertipDot, {
+          <View style={[styles.dot, {
             left: x - 10,
             top: y - 10,
-            backgroundColor: mode === 'draw' ? '#FF3B30' : 'rgba(255,255,255,0.5)',
-            transform: [{ scale: mode === 'draw' ? 1.2 : 1 }]
-          }]}/>
+            backgroundColor: mode === 'draw' ? '#FF3B30' : 'rgba(255,255,255,0.5)'
+          }]} />
         )
       })()}
 
-      {/* Mode indicator */}
-      <View style={[styles.modeBadge, { borderColor: modeColor }]}>
-        <Text style={[styles.modeText, { color: modeColor }]}>{modeLabel}</Text>
+      {/* Mode label */}
+      <View style={styles.modeBox}>
+        <Text style={{ color: 'white' }}>
+          {mode === 'draw' ? '✏️ Drawing (Pinch)' : '✋ Open hand'}
+        </Text>
       </View>
 
-      {/* Instructions */}
-      <View style={styles.instructions}>
-        <Text style={styles.instrText}>☝️ Index up = Draw</Text>
-        <Text style={styles.instrText}>✊ Fist = Clear</Text>
-        <Text style={styles.instrText}>✋ Other = Pause</Text>
-      </View>
-
-      {/* Manual clear button */}
-      <TouchableOpacity style={styles.clearBtn} onPress={() => { setPaths([]); setCurrentPath('') }}>
-        <Text style={styles.clearBtnText}>Clear</Text>
+      {/* Clear button */}
+      <TouchableOpacity
+        style={styles.clearBtn}
+        onPress={() => {
+          setPaths([])
+          setCurrentPath('')
+        }}>
+        <Text style={{ color: 'white' }}>Clear</Text>
       </TouchableOpacity>
 
     </View>
@@ -182,7 +195,7 @@ export default function App() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: 'black' },
-  fingertipDot: {
+  dot: {
     position: 'absolute',
     width: 20,
     height: 20,
@@ -190,35 +203,20 @@ const styles = StyleSheet.create({
     borderWidth: 2,
     borderColor: 'white',
   },
-  modeBadge: {
+  modeBox: {
     position: 'absolute',
     top: 60,
     alignSelf: 'center',
-    borderWidth: 1.5,
-    borderRadius: 20,
-    paddingHorizontal: 16,
-    paddingVertical: 8,
     backgroundColor: 'rgba(0,0,0,0.5)',
+    padding: 10,
+    borderRadius: 10,
   },
-  modeText: { fontSize: 16, fontWeight: '600' },
-  instructions: {
-    position: 'absolute',
-    bottom: 100,
-    left: 20,
-    backgroundColor: 'rgba(0,0,0,0.55)',
-    padding: 12,
-    borderRadius: 12,
-    gap: 4,
-  },
-  instrText: { color: 'white', fontSize: 13 },
   clearBtn: {
     position: 'absolute',
-    bottom: 40,
+    bottom: 50,
     alignSelf: 'center',
-    backgroundColor: 'rgba(255,59,48,0.8)',
-    paddingHorizontal: 32,
-    paddingVertical: 12,
-    borderRadius: 24,
+    backgroundColor: 'red',
+    padding: 12,
+    borderRadius: 20,
   },
-  clearBtnText: { color: 'white', fontSize: 16, fontWeight: '600' },
 })
