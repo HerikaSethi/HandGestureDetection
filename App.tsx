@@ -1,8 +1,7 @@
 import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react'
-import { View, Text, StyleSheet, Dimensions, TouchableOpacity } from 'react-native'
+import { View, Text, StyleSheet, Dimensions } from 'react-native'
 import { Camera, useCameraDevice, useFrameProcessor, VisionCameraProxy } from 'react-native-vision-camera'
 import { Worklets } from 'react-native-worklets-core'
-import Svg, { Path } from 'react-native-svg'
 
 const detectHandsPlugin = VisionCameraProxy.initFrameProcessorPlugin('detectHands', {})
 
@@ -10,33 +9,24 @@ const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window')
 const CAMERA_RENDER_HEIGHT = SCREEN_WIDTH * (640 / 480)
 const CAMERA_OFFSET_Y = (SCREEN_HEIGHT - CAMERA_RENDER_HEIGHT) / 2
 
-// CONFIG
-const SMOOTHING = 0.6
-const MIN_DISTANCE = 4
 const PINCH_THRESHOLD = 0.06
 
-// Convert normalized → screen
 const toScreen = (point: any, isFront: boolean) => ({
   x: (isFront ? 1 - point.x : point.x) * SCREEN_WIDTH,
   y: CAMERA_OFFSET_Y + point.y * CAMERA_RENDER_HEIGHT,
 })
 
-// Distance between 2 points
 const getDistance = (a: any, b: any) => {
   const dx = a.x - b.x
   const dy = a.y - b.y
   return Math.sqrt(dx * dx + dy * dy)
 }
 
-// Pinch detection
 const getMode = (landmarks: any[]): 'draw' | 'idle' => {
   const thumb = landmarks[4]
   const index = landmarks[8]
-
   const dist = getDistance(thumb, index)
-
-  if (dist < PINCH_THRESHOLD) return 'draw'
-  return 'idle'
+  return dist < PINCH_THRESHOLD ? 'draw' : 'idle'
 }
 
 export default function App() {
@@ -46,10 +36,10 @@ export default function App() {
   const [hands, setHands] = useState<any[]>([])
   const [mode, setMode] = useState<'draw' | 'idle'>('idle')
 
-  const [paths, setPaths] = useState<string[]>([])
-  const [currentPath, setCurrentPath] = useState<string>('')
+  const [finger, setFinger] = useState<{ x: number; y: number } | null>(null)
 
-  const lastPointRef = useRef<{ x: number; y: number } | null>(null)
+  const [balloons, setBalloons] = useState<{ id: number; x: number; y: number }[]>([])
+  const [score, setScore] = useState(0)
 
   useEffect(() => {
     Camera.requestCameraPermission().then((status) => {
@@ -57,17 +47,40 @@ export default function App() {
     })
   }, [])
 
+  // 🎈 Spawn balloons
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setBalloons(prev => [
+        ...prev,
+        {
+          id: Date.now(),
+          x: Math.random() * SCREEN_WIDTH,
+          y: SCREEN_HEIGHT + 50,
+        }
+      ])
+    }, 1200)
+
+    return () => clearInterval(interval)
+  }, [])
+
+  // 🎈 Move balloons
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setBalloons(prev =>
+        prev
+          .map(b => ({ ...b, y: b.y - 4 }))
+          .filter(b => b.y > -50)
+      )
+    }, 40)
+
+    return () => clearInterval(interval)
+  }, [])
+
   const onResult = useCallback((data: any) => {
     if (!data?.hands?.length) {
       setHands([])
       setMode('idle')
-
-      setCurrentPath(prev => {
-        if (prev) setPaths(p => [...p, prev])
-        return ''
-      })
-
-      lastPointRef.current = null
+      setFinger(null)
       return
     }
 
@@ -77,52 +90,35 @@ export default function App() {
     const detectedMode = getMode(landmarks)
     setMode(detectedMode)
 
+    const { x, y } = toScreen(landmarks[8], true)
+    setFinger({ x, y })
+
+    // 🎯 Collision detection
     if (detectedMode === 'draw') {
-      let { x, y } = toScreen(landmarks[8], true)
+      setBalloons(prev => {
+        const remaining: typeof prev = []
 
-      // smoothing
-      if (lastPointRef.current) {
-        x = lastPointRef.current.x * SMOOTHING + x * (1 - SMOOTHING)
-        y = lastPointRef.current.y * SMOOTHING + y * (1 - SMOOTHING)
+        prev.forEach(b => {
+          const dx = x - b.x
+          const dy = y - b.y
+          const dist = Math.sqrt(dx * dx + dy * dy)
 
-        // jitter filter
-        const dx = x - lastPointRef.current.x
-        const dy = y - lastPointRef.current.y
-        const dist = Math.sqrt(dx * dx + dy * dy)
+          if (dist < 40) {
+            // 💥 POP!
+            setScore(s => s + 1)
+          } else {
+            remaining.push(b)
+          }
+        })
 
-        if (dist < MIN_DISTANCE) return
-      }
-
-      if (!lastPointRef.current) {
-        setCurrentPath(`M${x.toFixed(1)},${y.toFixed(1)}`)
-      } else {
-        const lx = lastPointRef.current.x
-        const ly = lastPointRef.current.y
-
-        const mx = (lx + x) / 2
-        const my = (ly + y) / 2
-
-        setCurrentPath(prev =>
-          `${prev} Q${lx.toFixed(1)},${ly.toFixed(1)} ${mx.toFixed(1)},${my.toFixed(1)}`
-        )
-      }
-
-      lastPointRef.current = { x, y }
-
-    } else {
-      // stop drawing
-      if (currentPath) {
-        setPaths(prev => [...prev, currentPath])
-        setCurrentPath('')
-      }
-      lastPointRef.current = null
+        return remaining
+      })
     }
 
-  }, [currentPath])
+  }, [])
 
   const onResultJS = useMemo(() => Worklets.createRunOnJS(onResult), [onResult])
 
-  // frame skipping for performance
   const frameCount = useRef(0)
 
   const frameProcessor = useFrameProcessor((frame) => {
@@ -150,44 +146,42 @@ export default function App() {
         frameProcessor={frameProcessor}
       />
 
-      {/* Drawing */}
-      <Svg style={StyleSheet.absoluteFill}>
-        {paths.map((d, i) => (
-          <Path key={i} d={d} stroke="#FF3B30" strokeWidth={4} fill="none" strokeLinecap="round" />
-        ))}
-        {currentPath ? (
-          <Path d={currentPath} stroke="#FF3B30" strokeWidth={4} fill="none" strokeLinecap="round" />
-        ) : null}
-      </Svg>
+      {/* 🎈 Balloons */}
+      {balloons.map(b => (
+        <View
+          key={b.id}
+          style={{
+            position: 'absolute',
+            left: b.x - 25,
+            top: b.y - 25,
+            width: 50,
+            height: 50,
+            borderRadius: 25,
+            backgroundColor: 'skyblue',
+          }}
+        />
+      ))}
 
-      {/* fingertip indicator */}
-      {hands.length > 0 && (() => {
-        const { x, y } = toScreen(hands[0].landmarks[8], true)
-        return (
-          <View style={[styles.dot, {
-            left: x - 10,
-            top: y - 10,
-            backgroundColor: mode === 'draw' ? '#FF3B30' : 'rgba(255,255,255,0.5)'
-          }]} />
-        )
-      })()}
+      {/* 👉 Finger cursor */}
+      {finger && (
+        <View style={[styles.dot, {
+          left: finger.x - 10,
+          top: finger.y - 10,
+          backgroundColor: mode === 'draw' ? '#FF3B30' : 'white'
+        }]} />
+      )}
 
-      {/* Mode label */}
-      <View style={styles.modeBox}>
-        <Text style={{ color: 'white' }}>
-          {mode === 'draw' ? '✏️ Drawing (Pinch)' : '✋ Open hand'}
-        </Text>
+      {/* ⭐ Score */}
+      <View style={styles.scoreBox}>
+        <Text style={styles.scoreText}>Score: {score}</Text>
       </View>
 
-      {/* Clear button */}
-      <TouchableOpacity
-        style={styles.clearBtn}
-        onPress={() => {
-          setPaths([])
-          setCurrentPath('')
-        }}>
-        <Text style={{ color: 'white' }}>Clear</Text>
-      </TouchableOpacity>
+      {/* Mode */}
+      <View style={styles.modeBox}>
+        <Text style={{ color: 'white' }}>
+          {mode === 'draw' ? '🤏 Pinch = Pop' : '✋ Move hand'}
+        </Text>
+      </View>
 
     </View>
   )
@@ -195,6 +189,7 @@ export default function App() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: 'black' },
+
   dot: {
     position: 'absolute',
     width: 20,
@@ -203,20 +198,22 @@ const styles = StyleSheet.create({
     borderWidth: 2,
     borderColor: 'white',
   },
+
+  scoreBox: {
+    position: 'absolute',
+    top: 50,
+    left: 20,
+  },
+
+  scoreText: {
+    color: 'white',
+    fontSize: 20,
+    fontWeight: 'bold',
+  },
+
   modeBox: {
     position: 'absolute',
-    top: 60,
-    alignSelf: 'center',
-    backgroundColor: 'rgba(0,0,0,0.5)',
-    padding: 10,
-    borderRadius: 10,
-  },
-  clearBtn: {
-    position: 'absolute',
-    bottom: 50,
-    alignSelf: 'center',
-    backgroundColor: 'red',
-    padding: 12,
-    borderRadius: 20,
+    top: 50,
+    right: 20,
   },
 })
