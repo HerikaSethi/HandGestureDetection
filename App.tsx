@@ -9,13 +9,12 @@ const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window')
 const CAMERA_RENDER_HEIGHT = SCREEN_WIDTH * (640 / 480)
 const CAMERA_OFFSET_Y = (SCREEN_HEIGHT - CAMERA_RENDER_HEIGHT) / 2
 
-const PINCH_THRESHOLD = 0.06
+const PINCH_THRESHOLD = 0.08
 
 const toScreen = (point: any, isFront: boolean) => ({
-  x: (isFront ? 1 - point.x : point.x) * SCREEN_WIDTH,
-  y: CAMERA_OFFSET_Y + point.y * CAMERA_RENDER_HEIGHT,
+  x: (isFront ? 1 - point.y : point.y) * SCREEN_WIDTH,
+  y: CAMERA_OFFSET_Y + (1 - point.x) * CAMERA_RENDER_HEIGHT,  // ✅ added 1 -
 })
-
 const getDistance = (a: any, b: any) => {
   const dx = a.x - b.x
   const dy = a.y - b.y
@@ -23,9 +22,7 @@ const getDistance = (a: any, b: any) => {
 }
 
 const getMode = (landmarks: any[]): 'draw' | 'idle' => {
-  const thumb = landmarks[4]
-  const index = landmarks[8]
-  const dist = getDistance(thumb, index)
+  const dist = getDistance(landmarks[4], landmarks[8])
   return dist < PINCH_THRESHOLD ? 'draw' : 'idle'
 }
 
@@ -33,13 +30,14 @@ export default function App() {
   const device = useCameraDevice('front')
   const [hasPermission, setHasPermission] = useState<boolean | null>(null)
 
-  const [hands, setHands] = useState<any[]>([])
   const [mode, setMode] = useState<'draw' | 'idle'>('idle')
-
   const [finger, setFinger] = useState<{ x: number; y: number } | null>(null)
 
   const [balloons, setBalloons] = useState<{ id: number; x: number; y: number }[]>([])
   const [score, setScore] = useState(0)
+
+  const lastPopTime = useRef(0)
+  const frameCount = useRef(0)
 
   useEffect(() => {
     Camera.requestCameraPermission().then((status) => {
@@ -78,14 +76,12 @@ export default function App() {
 
   const onResult = useCallback((data: any) => {
     if (!data?.hands?.length) {
-      setHands([])
       setMode('idle')
       setFinger(null)
       return
     }
 
     const landmarks = data.hands[0].landmarks
-    setHands(data.hands)
 
     const detectedMode = getMode(landmarks)
     setMode(detectedMode)
@@ -93,22 +89,25 @@ export default function App() {
     const { x, y } = toScreen(landmarks[8], true)
     setFinger({ x, y })
 
-    // 🎯 Collision detection
+    const now = Date.now()
+    if (now - lastPopTime.current < 150) return
+
     if (detectedMode === 'draw') {
       setBalloons(prev => {
-        const remaining: typeof prev = []
+        let popped = false
 
-        prev.forEach(b => {
+        const remaining = prev.filter(b => {
           const dx = x - b.x
           const dy = y - b.y
           const dist = Math.sqrt(dx * dx + dy * dy)
 
-          if (dist < 40) {
-            // 💥 POP!
+          if (dist < 40 && !popped) {
+            popped = true
+            lastPopTime.current = now
             setScore(s => s + 1)
-          } else {
-            remaining.push(b)
+            return false
           }
+          return true
         })
 
         return remaining
@@ -119,22 +118,22 @@ export default function App() {
 
   const onResultJS = useMemo(() => Worklets.createRunOnJS(onResult), [onResult])
 
-  const frameCount = useRef(0)
-
   const frameProcessor = useFrameProcessor((frame) => {
     'worklet'
 
     frameCount.current++
     if (frameCount.current % 2 !== 0) return
 
-    if (detectHandsPlugin == null) return
+    if (!detectHandsPlugin) return
+
     const result = detectHandsPlugin.call(frame)
     onResultJS(result)
+
   }, [onResultJS])
 
   if (hasPermission === null) return <Text>Requesting permission...</Text>
   if (!hasPermission) return <Text>No permission</Text>
-  if (device == null) return <Text>Loading camera...</Text>
+  if (!device) return <Text>Loading camera...</Text>
 
   return (
     <View style={styles.container}>
@@ -142,7 +141,7 @@ export default function App() {
       <Camera
         style={StyleSheet.absoluteFill}
         device={device}
-        isActive={true}
+        isActive
         frameProcessor={frameProcessor}
       />
 
@@ -157,7 +156,7 @@ export default function App() {
             width: 50,
             height: 50,
             borderRadius: 25,
-            backgroundColor: 'skyblue',
+            backgroundColor: '#4FC3F7',
           }}
         />
       ))}
@@ -172,16 +171,12 @@ export default function App() {
       )}
 
       {/* ⭐ Score */}
-      <View style={styles.scoreBox}>
-        <Text style={styles.scoreText}>Score: {score}</Text>
-      </View>
+      <Text style={styles.score}>🎯 {score}</Text>
 
       {/* Mode */}
-      <View style={styles.modeBox}>
-        <Text style={{ color: 'white' }}>
-          {mode === 'draw' ? '🤏 Pinch = Pop' : '✋ Move hand'}
-        </Text>
-      </View>
+      <Text style={styles.mode}>
+        {mode === 'draw' ? '🤏 Pinch to Pop' : '✋ Move hand'}
+      </Text>
 
     </View>
   )
@@ -199,21 +194,20 @@ const styles = StyleSheet.create({
     borderColor: 'white',
   },
 
-  scoreBox: {
+  score: {
     position: 'absolute',
-    top: 50,
+    top: 60,
     left: 20,
-  },
-
-  scoreText: {
     color: 'white',
-    fontSize: 20,
+    fontSize: 24,
     fontWeight: 'bold',
   },
 
-  modeBox: {
+  mode: {
     position: 'absolute',
-    top: 50,
+    top: 60,
     right: 20,
+    color: 'white',
+    fontSize: 16,
   },
 })
