@@ -2,6 +2,7 @@ import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react'
 import { View, Text, StyleSheet, Dimensions } from 'react-native'
 import { Camera, useCameraDevice, useFrameProcessor, VisionCameraProxy } from 'react-native-vision-camera'
 import { Worklets } from 'react-native-worklets-core'
+import Sound from 'react-native-sound'
 
 const detectHandsPlugin = VisionCameraProxy.initFrameProcessorPlugin('detectHands', {})
 
@@ -11,10 +12,30 @@ const CAMERA_OFFSET_Y = (SCREEN_HEIGHT - CAMERA_RENDER_HEIGHT) / 2
 
 const PINCH_THRESHOLD = 0.08
 
+const BALLOON_COLORS = [
+  '#FF3B30', // red
+  '#FF9500', // orange
+  '#FFCC00', // yellow
+  '#34C759', // green
+  '#4FC3F7', // light blue
+  '#007AFF', // blue
+  '#AF52DE', // purple
+  '#FF2D55', // pink
+  '#00C7BE', // teal
+  '#FF6B35', // coral
+]
+
+// 🔊 Init sound (needs to be outside component so it loads once)
+Sound.setCategory('Playback')
+const popSound = new Sound('pop.mp3', Sound.MAIN_BUNDLE, (error) => {
+  if (error) console.log('Failed to load pop sound', error)
+})
+
 const toScreen = (point: any, isFront: boolean) => ({
   x: (isFront ? 1 - point.y : point.y) * SCREEN_WIDTH,
-  y: CAMERA_OFFSET_Y + (1 - point.x) * CAMERA_RENDER_HEIGHT,  // ✅ added 1 -
+  y: CAMERA_OFFSET_Y + (1 - point.x) * CAMERA_RENDER_HEIGHT,
 })
+
 const getDistance = (a: any, b: any) => {
   const dx = a.x - b.x
   const dy = a.y - b.y
@@ -26,6 +47,8 @@ const getMode = (landmarks: any[]): 'draw' | 'idle' => {
   return dist < PINCH_THRESHOLD ? 'draw' : 'idle'
 }
 
+const randomColor = () => BALLOON_COLORS[Math.floor(Math.random() * BALLOON_COLORS.length)]
+
 export default function App() {
   const device = useCameraDevice('front')
   const [hasPermission, setHasPermission] = useState<boolean | null>(null)
@@ -33,7 +56,7 @@ export default function App() {
   const [mode, setMode] = useState<'draw' | 'idle'>('idle')
   const [finger, setFinger] = useState<{ x: number; y: number } | null>(null)
 
-  const [balloons, setBalloons] = useState<{ id: number; x: number; y: number }[]>([])
+  const [balloons, setBalloons] = useState<{ id: number; x: number; y: number; color: string }[]>([])
   const [score, setScore] = useState(0)
 
   const lastPopTime = useRef(0)
@@ -43,6 +66,11 @@ export default function App() {
     Camera.requestCameraPermission().then((status) => {
       setHasPermission(status === 'granted')
     })
+
+    // Cleanup sound on unmount
+    return () => {
+      popSound.release()
+    }
   }, [])
 
   // 🎈 Spawn balloons
@@ -54,6 +82,7 @@ export default function App() {
           id: Date.now(),
           x: Math.random() * SCREEN_WIDTH,
           y: SCREEN_HEIGHT + 50,
+          color: randomColor(),
         }
       ])
     }, 1200)
@@ -72,6 +101,12 @@ export default function App() {
     }, 40)
 
     return () => clearInterval(interval)
+  }, [])
+
+  const playPop = useCallback(() => {
+    popSound.stop(() => {
+      popSound.play()
+    })
   }, [])
 
   const onResult = useCallback((data: any) => {
@@ -105,6 +140,7 @@ export default function App() {
             popped = true
             lastPopTime.current = now
             setScore(s => s + 1)
+            playPop()
             return false
           }
           return true
@@ -114,7 +150,7 @@ export default function App() {
       })
     }
 
-  }, [])
+  }, [playPop])
 
   const onResultJS = useMemo(() => Worklets.createRunOnJS(onResult), [onResult])
 
@@ -156,7 +192,13 @@ export default function App() {
             width: 50,
             height: 50,
             borderRadius: 25,
-            backgroundColor: '#4FC3F7',
+            backgroundColor: b.color,
+            // subtle shine effect
+            shadowColor: b.color,
+            shadowOffset: { width: 0, height: 2 },
+            shadowOpacity: 0.8,
+            shadowRadius: 4,
+            elevation: 5,
           }}
         />
       ))}
